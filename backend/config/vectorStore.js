@@ -1,89 +1,95 @@
-const { FaissStore } = require('@langchain/community/vectorstores/faiss');
- const fs = require('fs');
-const {Document} = require('../models/Document');
+const { Document, DocumentChunk } = require('../models/Document');
 const { embeddingsModel } = require('./langchain');
 require('dotenv').config();
 
-// Initialize ChromaDB client with Langchain's Chroma
-const getVectorStore = async () => {
-  const directory = process.env.FAISS_DB_PATH || './faissdb';
-  // Ensure the directory exists
-  if (!fs.existsSync(directory)) {
-    fs.mkdirSync(directory, { recursive: true });
-  }
+// Add document chunks to MongoDB Atlas Vector Search (save embeddings to mongo collection)
+const addDocumentChunks = async (chunks) => {
+  if (!chunks || chunks.length === 0) return;
 
   try {
-     const faissIndexPath = `${directory}/faiss.index`;
-      if (!fs.existsSync(faissIndexPath)) {
-        console.log("FAISS index file not found, returning null.");
-        return null; // Indicate that no store exists yet
+    const texts = chunks.map(chunk => chunk.content);
+    // Batch generate embeddings using OpenRouter/OpenAI API
+    const embeddings = await embeddingsModel.embedDocuments(texts);
+
+    // Prepare bulk write operations to update DocumentChunk documents with their embeddings
+    const bulkOps = chunks.map((chunk, index) => ({
+      updateOne: {
+        filter: { _id: chunk._id },
+        update: { $set: { embedding: embeddings[index] } }
       }
-     const vectorStore = await FaissStore.load(directory, embeddingsModel);
-      return vectorStore;
-    } catch (error) {
-     console.log("Error loading FAISS store, likely not found:", error.message);
-     return null; // Indicate that no store exists yet
-   }
+    }));
+
+    await DocumentChunk.bulkWrite(bulkOps);
+    console.log(`Successfully generated and stored ${chunks.length} embeddings in MongoDB.`);
+  } catch (error) {
+    console.error('Error adding document chunks/embeddings to MongoDB:', error);
+    throw error;
+  }
 };
 
-// Add document chunks to faiss db
-const addDocumentChunks = async (chunks) => {
-  let vectorStore = await getVectorStore();
-
-  const documents = chunks.map(chunk => chunk.content);
-
-  const metadatas = chunks.map(chunk => ({
-    documentId: chunk.documentId.toString(),
-    position: chunk.position,
-    filename: chunk.filename // Add filename to metadata
-  }));
-
-  // Prepare documents in Langchain format
-  const langchainDocuments = documents.map((doc, index) => ({
-    pageContent: doc,
-    metadata: metadatas[index],
-  }));
-
-  // Ensure the directory exists for saving
-  const directory = process.env.FAISS_DB_PATH || './faissdb';
-  if (!fs.existsSync(directory)) {
-    fs.mkdirSync(directory, { recursive: true });
-  }
-
-  if (!vectorStore) {
-    // If no existing store, create a new one from documents
-    vectorStore = await FaissStore.fromDocuments(langchainDocuments, embeddingsModel);
-  } else {
-    // Otherwise, add documents to the existing store
-    await vectorStore.addDocuments(langchainDocuments);
-  }
-
-  await vectorStore.save(directory);
-};
-
-// Query similar chunks
+// Query similar chunks from MongoDB Atlas Vector Search
 const querySimilarChunks = async (query, userId, n = 5) => {
-  const vectorStore = await getVectorStore();
+  try {
+    const queryEmbedding = await embeddingsModel.embedQuery(query);
 
-  const resultsWithScore = await vectorStore.similaritySearchWithScore(query, n);
-  console.log(resultsWithScore)
-  const results = resultsWithScore.map(([doc, score]) => {
-    doc.score = score; // Attach score to the document object
-    return doc;
-  });
+    // MongoDB Atlas Vector Search pipeline stage
+    const results = await DocumentChunk.aggregate([
+      {
+        $vectorSearch: {
+          index: "vector_index", // Name of the Atlas Vector Search Index
+          path: "embedding",     // Field holding the vector
+          queryVector: queryEmbedding,
+          numCandidates: 100,    // Recommended to be between 10x and 20x the limit
+          limit: n
+        }
+      },
+      {
+        // Join document collection to retrieve document metadata and authorize by userId
+        $lookup: {
+          from: "documents",
+          localField: "documentId",
+          foreignField: "_id",
+          as: "documentInfo"
+        }
+      },
+      {
+        $unwind: "$documentInfo"
+      },
+      {
+        // Filter results by userId so users can only search their own documents
+        $match: {
+          "documentInfo.userId": userId
+        }
+      },
+      {
+        $project: {
+          content: 1,
+          documentId: 1,
+          position: 1,
+          "documentInfo.filename": 1,
+          // Atlas Vector Search score
+          score: { $meta: "vectorSearchScore" }
+        }
+      }
+    ]);
 
-  // Filter results by userId
-  const userDocuments = await Document.find({ userId: userId });
-  const userDocumentIds = new Set(userDocuments.map(doc => doc._id.toString()));
-
-  return results.filter(doc => userDocumentIds.has(doc.metadata.documentId));
-
- };
-
-
+    // Format output to match LangChain style interface expected by controller
+    return results.map(item => ({
+      pageContent: item.content,
+      metadata: {
+        documentId: item.documentId.toString(),
+        position: item.position,
+        filename: item.documentInfo.filename
+      },
+      score: item.score
+    }));
+  } catch (error) {
+    console.error('Error querying similar chunks from MongoDB:', error);
+    return [];
+  }
+};
 
 module.exports = {
-  getVectorStore,
   addDocumentChunks,
   querySimilarChunks,
 };

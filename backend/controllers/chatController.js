@@ -32,15 +32,27 @@ const sendMessage = async (req, res) => {
       return res.status(404).json({ error: 'Chat session not found' });
     }
 
+    console.log(`\n================== RAG QUERY START ==================`);
+    console.log(`User Question: "${message}"`);
+
     // Find relevant documents
     const relevantDocs = await querySimilarChunks(message, req.user._id);
+    console.log(`Retrieved Chunks Count: ${relevantDocs.length}`);
+
+    if (relevantDocs.length > 0) {
+      relevantDocs.forEach((doc, i) => {
+        console.log(`\n[Chunk ${i + 1}] (Score: ${doc.score || 'N/A'}) from "${doc.metadata.filename}":`);
+        console.log(`"${doc.pageContent.substring(0, 200)}..."`);
+      });
+    } else {
+      console.log(`⚠️ WARNING: 0 chunks retrieved! This means MongoDB Atlas Vector Search returned empty. Check if the index 'vector_index' has finished building on your collection.`);
+    }
+    console.log(`=================== RAG QUERY END ===================\n`);
 
     // Create context from relevant documents
     const context = relevantDocs
       .map(doc => doc.pageContent)
       .join('\n\n');
-
-      // console.log("context is :", context)
     // Prepare conversation history
     const conversationHistory = session.messages.map(msg => ({
       role: msg.role,
